@@ -1,0 +1,538 @@
+(********************************************************************
+* 项目: 三机床 + 库卡机器人 + 4托盘架 柔性单元控制（模块化）
+* 语言: Siemens SCL
+* 设计原则: 每个功能单独块，便于调试、复用、维护
+********************************************************************)
+
+TYPE "E_CellState" : (
+    ST_INIT,
+    ST_IDLE,
+    ST_AUTO_RUN,
+    ST_STOPPING,
+    ST_FAULT
+);
+END_TYPE
+
+TYPE "E_MachineState" : (
+    MC_IDLE,
+    MC_WAIT_LOAD,
+    MC_PROCESSING,
+    MC_WAIT_UNLOAD,
+    MC_FAULT
+);
+END_TYPE
+
+TYPE "E_AlarmCode" : (
+    ALM_NONE,
+    ALM_ESTOP_ACTIVE,
+    ALM_SAFETY_DOOR_OPEN,
+    ALM_AIR_PRESS_LOW,
+    ALM_SERVO_NOT_READY,
+    ALM_MACHINE1_FAULT,
+    ALM_MACHINE2_FAULT,
+    ALM_MACHINE3_FAULT,
+    ALM_NO_RAW_PART,
+    ALM_GRIPPER_MISMATCH,
+    ALM_GRIPPER_EMPTY,
+    ALM_TRAY_FULL,
+    ALM_TRAY_EMPTY,
+    ALM_ROBOT_TIMEOUT,
+    ALM_HANDSHAKE_TIMEOUT
+);
+END_TYPE
+
+TYPE "T_Gripper" : STRUCT
+    Present        : BOOL;
+    Healthy        : BOOL;
+    HasPart        : BOOL;
+    PartID         : DINT;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_Tray" : STRUCT
+    Capacity       : INT;
+    RawCount       : INT;
+    DoneCount      : INT;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_MachineIO" : STRUCT
+    Ready          : BOOL;
+    Fault          : BOOL;
+    DoorClosed     : BOOL;
+    ClampOK        : BOOL;
+    CycleDone      : BOOL;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_MachineCtrl" : STRUCT
+    State          : "E_MachineState";
+    CurrentPartID  : DINT;
+    ProcessedCount : DINT;
+    LoadReq        : BOOL;
+    UnloadReq      : BOOL;
+    RunCmd         : BOOL;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_HMI" : STRUCT
+    CmdStart       : BOOL;
+    CmdStop        : BOOL;
+    CmdReset       : BOOL;
+    ModeAuto       : BOOL;
+    AckAlarm       : BOOL;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_Safety" : STRUCT
+    EStopOK          : BOOL;
+    SafetyDoorClosed : BOOL;
+    AirPressureOK    : BOOL;
+    ServoReady       : BOOL;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_CellStats" : STRUCT
+    TotalRaw       : DINT;
+    TotalDone      : DINT;
+    TotalInProcess : DINT;
+    RemainingRaw   : DINT;
+    MachineDone    : ARRAY[1..3] OF DINT;
+END_STRUCT;
+END_TYPE
+
+FUNCTION "FC_AlarmTextID" : INT
+VAR_INPUT
+    Code : "E_AlarmCode";
+END_VAR
+BEGIN
+    CASE Code OF
+        ALM_NONE:              "FC_AlarmTextID" := 0;
+        ALM_ESTOP_ACTIVE:      "FC_AlarmTextID" := 1001;
+        ALM_SAFETY_DOOR_OPEN:  "FC_AlarmTextID" := 1002;
+        ALM_AIR_PRESS_LOW:     "FC_AlarmTextID" := 1003;
+        ALM_SERVO_NOT_READY:   "FC_AlarmTextID" := 1004;
+        ALM_MACHINE1_FAULT:    "FC_AlarmTextID" := 1101;
+        ALM_MACHINE2_FAULT:    "FC_AlarmTextID" := 1102;
+        ALM_MACHINE3_FAULT:    "FC_AlarmTextID" := 1103;
+        ALM_NO_RAW_PART:       "FC_AlarmTextID" := 1201;
+        ALM_GRIPPER_MISMATCH:  "FC_AlarmTextID" := 1202;
+        ALM_GRIPPER_EMPTY:     "FC_AlarmTextID" := 1203;
+        ALM_TRAY_FULL:         "FC_AlarmTextID" := 1204;
+        ALM_TRAY_EMPTY:        "FC_AlarmTextID" := 1205;
+        ALM_ROBOT_TIMEOUT:     "FC_AlarmTextID" := 1301;
+        ALM_HANDSHAKE_TIMEOUT: "FC_AlarmTextID" := 1302;
+        ELSE
+            "FC_AlarmTextID" := 1999;
+    END_CASE;
+END_FUNCTION
+
+FUNCTION "FC_CheckSafetyAndAlarm" : "E_AlarmCode"
+VAR_INPUT
+    Safety     : "T_Safety";
+    M1Fault    : BOOL;
+    M2Fault    : BOOL;
+    M3Fault    : BOOL;
+    RobotFault : BOOL;
+END_VAR
+BEGIN
+    "FC_CheckSafetyAndAlarm" := ALM_NONE;
+
+    IF NOT Safety.EStopOK THEN
+        "FC_CheckSafetyAndAlarm" := ALM_ESTOP_ACTIVE;
+    ELSIF NOT Safety.SafetyDoorClosed THEN
+        "FC_CheckSafetyAndAlarm" := ALM_SAFETY_DOOR_OPEN;
+    ELSIF NOT Safety.AirPressureOK THEN
+        "FC_CheckSafetyAndAlarm" := ALM_AIR_PRESS_LOW;
+    ELSIF NOT Safety.ServoReady THEN
+        "FC_CheckSafetyAndAlarm" := ALM_SERVO_NOT_READY;
+    ELSIF M1Fault THEN
+        "FC_CheckSafetyAndAlarm" := ALM_MACHINE1_FAULT;
+    ELSIF M2Fault THEN
+        "FC_CheckSafetyAndAlarm" := ALM_MACHINE2_FAULT;
+    ELSIF M3Fault THEN
+        "FC_CheckSafetyAndAlarm" := ALM_MACHINE3_FAULT;
+    ELSIF RobotFault THEN
+        "FC_CheckSafetyAndAlarm" := ALM_ROBOT_TIMEOUT;
+    END_IF;
+END_FUNCTION
+
+FUNCTION_BLOCK "FB_MachineUnit"
+VAR_INPUT
+    Enable    : BOOL;
+    IO        : "T_MachineIO";
+    PartLoaded: BOOL;
+END_VAR
+VAR_IN_OUT
+    Ctrl      : "T_MachineCtrl";
+END_VAR
+BEGIN
+    Ctrl.LoadReq := FALSE;
+    Ctrl.UnloadReq := FALSE;
+    Ctrl.RunCmd := FALSE;
+
+    IF (NOT Enable) OR IO.Fault THEN
+        Ctrl.State := MC_FAULT;
+    END_IF;
+
+    CASE Ctrl.State OF
+        MC_IDLE:
+            IF Enable AND IO.Ready AND IO.DoorClosed THEN
+                Ctrl.State := MC_WAIT_LOAD;
+            END_IF;
+
+        MC_WAIT_LOAD:
+            Ctrl.LoadReq := TRUE;
+            IF PartLoaded AND IO.ClampOK THEN
+                Ctrl.State := MC_PROCESSING;
+            END_IF;
+
+        MC_PROCESSING:
+            Ctrl.RunCmd := TRUE;
+            IF IO.CycleDone THEN
+                Ctrl.State := MC_WAIT_UNLOAD;
+            END_IF;
+
+        MC_WAIT_UNLOAD:
+            Ctrl.UnloadReq := TRUE;
+            IF Ctrl.CurrentPartID = 0 THEN
+                Ctrl.ProcessedCount := Ctrl.ProcessedCount + 1;
+                Ctrl.State := MC_WAIT_LOAD;
+            END_IF;
+
+        MC_FAULT:
+            Ctrl.RunCmd := FALSE;
+    END_CASE;
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK "FB_RobotDispatcher"
+VAR_INPUT
+    RobotReady      : BOOL;
+    RobotInCycle    : BOOL;
+    LoadReq         : ARRAY[1..3] OF BOOL;
+    UnloadReq       : ARRAY[1..3] OF BOOL;
+END_VAR
+VAR_IN_OUT
+    Trays           : ARRAY[1..4] OF "T_Tray";
+    Grippers        : ARRAY[1..4] OF "T_Gripper";
+    Machines        : ARRAY[1..3] OF "T_MachineCtrl";
+    PartIDSeed      : DINT;
+END_VAR
+VAR_OUTPUT
+    RobotStartCmd   : BOOL;
+    AlarmCode       : "E_AlarmCode";
+END_VAR
+VAR
+    i, j            : INT;
+    SelMachine      : INT;
+    SelTrayRaw      : INT;
+    SelTrayDone     : INT;
+    T_Handshake     : TON;
+    T_RobotCycle    : TON;
+    AnyNeed         : BOOL;
+    FoundFreeGrip   : BOOL;
+END_VAR
+BEGIN
+    AlarmCode := ALM_NONE;
+    RobotStartCmd := FALSE;
+    SelMachine := 0;
+    AnyNeed := FALSE;
+
+    FOR i := 1 TO 3 DO
+        IF (LoadReq[i] OR UnloadReq[i]) AND (SelMachine = 0) THEN
+            SelMachine := i;
+        END_IF;
+        IF LoadReq[i] OR UnloadReq[i] THEN
+            AnyNeed := TRUE;
+        END_IF;
+    END_FOR;
+
+    T_Handshake(IN := AnyNeed AND NOT RobotReady, PT := T#5S);
+    IF T_Handshake.Q THEN
+        AlarmCode := ALM_HANDSHAKE_TIMEOUT;
+        RETURN;
+    END_IF;
+
+    T_RobotCycle(IN := RobotInCycle, PT := T#45S);
+    IF T_RobotCycle.Q THEN
+        AlarmCode := ALM_ROBOT_TIMEOUT;
+        RETURN;
+    END_IF;
+
+    IF (SelMachine = 0) OR (NOT RobotReady) THEN
+        RETURN;
+    END_IF;
+
+    RobotStartCmd := TRUE;
+
+    SelTrayRaw := 0;
+    SelTrayDone := 0;
+
+    FOR i := 1 TO 4 DO
+        IF (SelTrayRaw = 0) AND (Trays[i].RawCount > 0) THEN
+            SelTrayRaw := i;
+        END_IF;
+        IF (SelTrayDone = 0) AND (Trays[i].DoneCount < Trays[i].Capacity) THEN
+            SelTrayDone := i;
+        END_IF;
+    END_FOR;
+
+    IF LoadReq[SelMachine] THEN
+        IF SelTrayRaw = 0 THEN
+            AlarmCode := ALM_NO_RAW_PART;
+            RETURN;
+        END_IF;
+
+        FoundFreeGrip := FALSE;
+        FOR j := 1 TO 4 DO
+            IF Grippers[j].Present AND Grippers[j].Healthy AND (NOT Grippers[j].HasPart) THEN
+                FoundFreeGrip := TRUE;
+                PartIDSeed := PartIDSeed + 1;
+                Grippers[j].HasPart := TRUE;
+                Grippers[j].PartID := PartIDSeed;
+                Trays[SelTrayRaw].RawCount := Trays[SelTrayRaw].RawCount - 1;
+                Machines[SelMachine].CurrentPartID := Grippers[j].PartID;
+                Grippers[j].HasPart := FALSE;
+                Grippers[j].PartID := 0;
+                EXIT;
+            END_IF;
+        END_FOR;
+
+        IF NOT FoundFreeGrip THEN
+            AlarmCode := ALM_GRIPPER_MISMATCH;
+            RETURN;
+        END_IF;
+    END_IF;
+
+    IF UnloadReq[SelMachine] THEN
+        IF SelTrayDone = 0 THEN
+            AlarmCode := ALM_TRAY_FULL;
+            RETURN;
+        END_IF;
+
+        IF Machines[SelMachine].CurrentPartID = 0 THEN
+            AlarmCode := ALM_GRIPPER_EMPTY;
+            RETURN;
+        END_IF;
+
+        FoundFreeGrip := FALSE;
+        FOR j := 1 TO 4 DO
+            IF Grippers[j].Present AND Grippers[j].Healthy AND (NOT Grippers[j].HasPart) THEN
+                FoundFreeGrip := TRUE;
+                Grippers[j].HasPart := TRUE;
+                Grippers[j].PartID := Machines[SelMachine].CurrentPartID;
+                Machines[SelMachine].CurrentPartID := 0;
+                Trays[SelTrayDone].DoneCount := Trays[SelTrayDone].DoneCount + 1;
+                Grippers[j].HasPart := FALSE;
+                Grippers[j].PartID := 0;
+                EXIT;
+            END_IF;
+        END_FOR;
+
+        IF NOT FoundFreeGrip THEN
+            AlarmCode := ALM_GRIPPER_MISMATCH;
+            RETURN;
+        END_IF;
+    END_IF;
+END_FUNCTION_BLOCK
+
+FUNCTION "FC_CalcStats" : "T_CellStats"
+VAR_INPUT
+    Trays    : ARRAY[1..4] OF "T_Tray";
+    Machines : ARRAY[1..3] OF "T_MachineCtrl";
+END_VAR
+VAR
+    i        : INT;
+    S        : "T_CellStats";
+END_VAR
+BEGIN
+    S.TotalRaw := 0;
+    S.TotalDone := 0;
+    S.TotalInProcess := 0;
+
+    FOR i := 1 TO 4 DO
+        S.TotalRaw := S.TotalRaw + INT_TO_DINT(Trays[i].RawCount);
+        S.TotalDone := S.TotalDone + INT_TO_DINT(Trays[i].DoneCount);
+    END_FOR;
+
+    FOR i := 1 TO 3 DO
+        IF Machines[i].CurrentPartID <> 0 THEN
+            S.TotalInProcess := S.TotalInProcess + 1;
+        END_IF;
+        S.MachineDone[i] := Machines[i].ProcessedCount;
+    END_FOR;
+
+    S.RemainingRaw := S.TotalRaw;
+    "FC_CalcStats" := S;
+END_FUNCTION
+
+FUNCTION_BLOCK "FB_FlexibleCell"
+VAR_INPUT
+    HMI            : "T_HMI";
+    Safety         : "T_Safety";
+    RobotReady     : BOOL;
+    RobotFault     : BOOL;
+    RobotInCycle   : BOOL;
+    MachineReadyIn : ARRAY[1..3] OF BOOL;
+    MachineFaultIn : ARRAY[1..3] OF BOOL;
+    MachineDoorIn  : ARRAY[1..3] OF BOOL;
+    MachineClampIn : ARRAY[1..3] OF BOOL;
+    MachineDoneIn  : ARRAY[1..3] OF BOOL;
+END_VAR
+VAR_OUTPUT
+    CellState      : "E_CellState";
+    AlarmActive    : BOOL;
+    AlarmCode      : "E_AlarmCode";
+    AlarmTextID    : INT;
+    StopAll        : BOOL;
+    RobotStartCmd  : BOOL;
+    LoadReq        : ARRAY[1..3] OF BOOL;
+    UnloadReq      : ARRAY[1..3] OF BOOL;
+    MachineRunCmd  : ARRAY[1..3] OF BOOL;
+    Stats          : "T_CellStats";
+END_VAR
+VAR
+    i              : INT;
+    SafetyAlarm    : "E_AlarmCode";
+    RobotAlarm     : "E_AlarmCode";
+    MIO            : ARRAY[1..3] OF "T_MachineIO";
+    MCtrl          : ARRAY[1..3] OF "T_MachineCtrl";
+    Trays          : ARRAY[1..4] OF "T_Tray";
+    Grippers       : ARRAY[1..4] OF "T_Gripper";
+    PartIDSeed     : DINT;
+    StartEdge      : R_TRIG;
+    ResetEdge      : R_TRIG;
+    DoorFall       : F_TRIG;
+    FB_M1          : "FB_MachineUnit";
+    FB_M2          : "FB_MachineUnit";
+    FB_M3          : "FB_MachineUnit";
+    FB_Robot       : "FB_RobotDispatcher";
+END_VAR
+BEGIN
+    StartEdge(CLK := HMI.CmdStart);
+    ResetEdge(CLK := HMI.CmdReset);
+    DoorFall(CLK := Safety.SafetyDoorClosed);
+
+    // 初始化托盘容量与手抓安装状态
+    FOR i := 1 TO 4 DO
+        IF Trays[i].Capacity = 0 THEN
+            Trays[i].Capacity := 40;
+        END_IF;
+        IF NOT Grippers[i].Present THEN
+            Grippers[i].Present := TRUE;
+        END_IF;
+        IF NOT Grippers[i].Healthy THEN
+            Grippers[i].Healthy := TRUE;
+        END_IF;
+    END_FOR;
+
+    FOR i := 1 TO 3 DO
+        MIO[i].Ready := MachineReadyIn[i];
+        MIO[i].Fault := MachineFaultIn[i];
+        MIO[i].DoorClosed := MachineDoorIn[i];
+        MIO[i].ClampOK := MachineClampIn[i];
+        MIO[i].CycleDone := MachineDoneIn[i];
+    END_FOR;
+
+    SafetyAlarm := "FC_CheckSafetyAndAlarm"(
+        Safety := Safety,
+        M1Fault := MIO[1].Fault,
+        M2Fault := MIO[2].Fault,
+        M3Fault := MIO[3].Fault,
+        RobotFault := RobotFault
+    );
+
+    AlarmCode := SafetyAlarm;
+    AlarmActive := (AlarmCode <> ALM_NONE);
+    AlarmTextID := "FC_AlarmTextID"(Code := AlarmCode);
+
+    IF DoorFall.Q THEN
+        CellState := ST_FAULT;
+    END_IF;
+
+    CASE CellState OF
+        ST_INIT:
+            StopAll := TRUE;
+            FOR i := 1 TO 3 DO
+                MCtrl[i].State := MC_IDLE;
+            END_FOR;
+            IF HMI.ModeAuto THEN
+                CellState := ST_IDLE;
+            END_IF;
+
+        ST_IDLE:
+            StopAll := TRUE;
+            IF AlarmActive THEN
+                CellState := ST_FAULT;
+            ELSIF StartEdge.Q AND HMI.ModeAuto THEN
+                CellState := ST_AUTO_RUN;
+            END_IF;
+
+        ST_AUTO_RUN:
+            StopAll := FALSE;
+            IF HMI.CmdStop THEN
+                CellState := ST_STOPPING;
+            ELSIF AlarmActive THEN
+                CellState := ST_FAULT;
+            ELSE
+                FB_M1(Enable := TRUE, IO := MIO[1], PartLoaded := (MCtrl[1].CurrentPartID <> 0), Ctrl := MCtrl[1]);
+                FB_M2(Enable := TRUE, IO := MIO[2], PartLoaded := (MCtrl[2].CurrentPartID <> 0), Ctrl := MCtrl[2]);
+                FB_M3(Enable := TRUE, IO := MIO[3], PartLoaded := (MCtrl[3].CurrentPartID <> 0), Ctrl := MCtrl[3]);
+
+                FOR i := 1 TO 3 DO
+                    LoadReq[i] := MCtrl[i].LoadReq;
+                    UnloadReq[i] := MCtrl[i].UnloadReq;
+                    MachineRunCmd[i] := MCtrl[i].RunCmd;
+                END_FOR;
+
+                FB_Robot(
+                    RobotReady := RobotReady,
+                    RobotInCycle := RobotInCycle,
+                    LoadReq := LoadReq,
+                    UnloadReq := UnloadReq,
+                    Trays := Trays,
+                    Grippers := Grippers,
+                    Machines := MCtrl,
+                    PartIDSeed := PartIDSeed,
+                    RobotStartCmd => RobotStartCmd,
+                    AlarmCode => RobotAlarm
+                );
+
+                IF RobotAlarm <> ALM_NONE THEN
+                    AlarmCode := RobotAlarm;
+                    AlarmActive := TRUE;
+                    AlarmTextID := "FC_AlarmTextID"(Code := AlarmCode);
+                    CellState := ST_FAULT;
+                END_IF;
+            END_IF;
+
+        ST_STOPPING:
+            StopAll := TRUE;
+            RobotStartCmd := FALSE;
+            FOR i := 1 TO 3 DO
+                LoadReq[i] := FALSE;
+                UnloadReq[i] := FALSE;
+                MachineRunCmd[i] := FALSE;
+            END_FOR;
+            IF NOT HMI.CmdStop THEN
+                CellState := ST_IDLE;
+            END_IF;
+
+        ST_FAULT:
+            StopAll := TRUE;
+            RobotStartCmd := FALSE;
+            FOR i := 1 TO 3 DO
+                LoadReq[i] := FALSE;
+                UnloadReq[i] := FALSE;
+                MachineRunCmd[i] := FALSE;
+            END_FOR;
+            IF HMI.AckAlarm AND ResetEdge.Q AND (SafetyAlarm = ALM_NONE) THEN
+                AlarmCode := ALM_NONE;
+                AlarmActive := FALSE;
+                AlarmTextID := 0;
+                CellState := ST_IDLE;
+            END_IF;
+    END_CASE;
+
+    Stats := "FC_CalcStats"(Trays := Trays, Machines := MCtrl);
+END_FUNCTION_BLOCK
