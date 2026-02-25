@@ -1,0 +1,746 @@
+(********************************************************************
+* 项目: 三机床 + 库卡机器人 + 4托盘架 柔性单元控制（模块化）
+* 语言: Siemens SCL
+* 增强点:
+* 1) 判断机床夹紧到位、机器人夹紧到位、托盘放置到位
+* 2) 托盘40工位逐位跟踪（哪些干完/哪些未干完）
+* 3) 多机床同时完工时，按加工时长自优化调度顺序
+********************************************************************)
+
+// ========================= 信号总表（类型 + 起始偏移）=========================
+// [安全输入]
+// Safety.EStopOK                    BOOL  %I0.0
+// Safety.SafetyDoorClosed           BOOL  %I0.1
+// Safety.AirPressureOK              BOOL  %I0.2
+// Safety.ServoReady                 BOOL  %I0.3
+// [HMI]
+// HMI.CmdStart                      BOOL  %M0.0
+// HMI.CmdStop                       BOOL  %M0.1
+// HMI.CmdReset                      BOOL  %M0.2
+// HMI.ModeAuto                      BOOL  %M0.3
+// HMI.AckAlarm                      BOOL  %M0.4
+// [机器人输入]
+// RobotReady                        BOOL  %I1.0
+// RobotFault                        BOOL  %I1.1
+// RobotInCycle                      BOOL  %I1.2
+// RobotGripOK                       BOOL  %I1.3   // 机器人夹紧到位
+// [机床输入(1..3)]
+// MachineReadyIn[i]                 BOOL  %I2.x~%I4.x
+// MachineFaultIn[i]                 BOOL  %I2.x~%I4.x
+// MachineDoorIn[i]                  BOOL  %I2.x~%I4.x
+// MachineClampIn[i]                 BOOL  %I2.x~%I4.x   // 机床夹紧到位
+// MachineDoneIn[i]                  BOOL  %I2.x~%I4.x
+// [托盘到位]
+// TrayRawPlaceOK[1..4]              BOOL  %I5.0~%I5.3
+// TrayDonePlaceOK[1..4]             BOOL  %I5.4~%I5.7
+
+TYPE "E_CellState" : (
+    ST_INIT,
+    ST_IDLE,
+    ST_AUTO_RUN,
+    ST_STOPPING,
+    ST_FAULT
+);
+END_TYPE
+
+TYPE "E_MachineState" : (
+    MC_IDLE,
+    MC_WAIT_LOAD,
+    MC_PROCESSING,
+    MC_WAIT_UNLOAD,
+    MC_FAULT
+);
+END_TYPE
+
+TYPE "E_AlarmCode" : (
+    ALM_NONE,
+    ALM_ESTOP_ACTIVE,
+    ALM_SAFETY_DOOR_OPEN,
+    ALM_AIR_PRESS_LOW,
+    ALM_SERVO_NOT_READY,
+    ALM_MACHINE1_FAULT,
+    ALM_MACHINE2_FAULT,
+    ALM_MACHINE3_FAULT,
+    ALM_NO_RAW_PART,
+    ALM_GRIPPER_MISMATCH,
+    ALM_GRIPPER_EMPTY,
+    ALM_TRAY_FULL,
+    ALM_TRAY_EMPTY,
+    ALM_ROBOT_TIMEOUT,
+    ALM_HANDSHAKE_TIMEOUT,
+    ALM_MACHINE_CLAMP_NOT_OK,
+    ALM_ROBOT_GRIP_NOT_OK,
+    ALM_TRAY_PLACE_NOT_OK
+);
+END_TYPE
+
+TYPE "T_Gripper" : STRUCT
+    Present        : BOOL;
+    Healthy        : BOOL;
+    HasPart        : BOOL;
+    PartID         : DINT;
+    SourceTray     : INT;   // 工件来源托盘
+    SourceSlot     : INT;   // 工件来源工位（用于完工追踪）
+END_STRUCT;
+END_TYPE
+
+TYPE "T_Tray" : STRUCT
+    Capacity       : INT;
+    RawCount       : INT;
+    DoneCount      : INT;
+    InitDone       : BOOL;
+    RawSlotOccupied  : ARRAY[1..40] OF BOOL; // 原料位占用
+    RawSlotProcessed : ARRAY[1..40] OF BOOL; // 该原料位是否已加工完成
+    DoneSlotOccupied : ARRAY[1..40] OF BOOL; // 成品位占用
+END_STRUCT;
+END_TYPE
+
+TYPE "T_MachineIO" : STRUCT
+    Ready          : BOOL;
+    Fault          : BOOL;
+    DoorClosed     : BOOL;
+    ClampOK        : BOOL;
+    CycleDone      : BOOL;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_MachineCtrl" : STRUCT
+    State          : "E_MachineState";
+    CurrentPartID  : DINT;
+    CurrentSrcTray : INT;
+    CurrentSrcSlot : INT;
+    ProcessedCount : DINT;
+    LastProcessMs  : DINT;
+    AvgProcessMs   : DINT;
+    LoadReq        : BOOL;
+    UnloadReq      : BOOL;
+    RunCmd         : BOOL;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_HMI" : STRUCT
+    CmdStart       : BOOL;
+    CmdStop        : BOOL;
+    CmdReset       : BOOL;
+    ModeAuto       : BOOL;
+    AckAlarm       : BOOL;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_Safety" : STRUCT
+    EStopOK          : BOOL;
+    SafetyDoorClosed : BOOL;
+    AirPressureOK    : BOOL;
+    ServoReady       : BOOL;
+END_STRUCT;
+END_TYPE
+
+TYPE "T_CellStats" : STRUCT
+    TotalRaw       : DINT;
+    TotalDone      : DINT;
+    TotalInProcess : DINT;
+    RemainingRaw   : DINT;
+    MachineDone    : ARRAY[1..3] OF DINT;
+    MachineAvgMs   : ARRAY[1..3] OF DINT;
+    TrayRawRemain  : ARRAY[1..4] OF DINT;
+    TrayDoneCount  : ARRAY[1..4] OF DINT;
+END_STRUCT;
+END_TYPE
+
+// 功能块说明: 报警枚举到HMI文本编号映射，HMI通过该编号显示对应报警文本
+FUNCTION "FC_AlarmTextID" : INT
+VAR_INPUT
+    Code : "E_AlarmCode";
+END_VAR
+BEGIN
+    CASE Code OF
+        ALM_NONE:                  "FC_AlarmTextID" := 0;
+        ALM_ESTOP_ACTIVE:          "FC_AlarmTextID" := 1001;
+        ALM_SAFETY_DOOR_OPEN:      "FC_AlarmTextID" := 1002;
+        ALM_AIR_PRESS_LOW:         "FC_AlarmTextID" := 1003;
+        ALM_SERVO_NOT_READY:       "FC_AlarmTextID" := 1004;
+        ALM_MACHINE1_FAULT:        "FC_AlarmTextID" := 1101;
+        ALM_MACHINE2_FAULT:        "FC_AlarmTextID" := 1102;
+        ALM_MACHINE3_FAULT:        "FC_AlarmTextID" := 1103;
+        ALM_NO_RAW_PART:           "FC_AlarmTextID" := 1201;
+        ALM_GRIPPER_MISMATCH:      "FC_AlarmTextID" := 1202;
+        ALM_GRIPPER_EMPTY:         "FC_AlarmTextID" := 1203;
+        ALM_TRAY_FULL:             "FC_AlarmTextID" := 1204;
+        ALM_TRAY_EMPTY:            "FC_AlarmTextID" := 1205;
+        ALM_ROBOT_TIMEOUT:         "FC_AlarmTextID" := 1301;
+        ALM_HANDSHAKE_TIMEOUT:     "FC_AlarmTextID" := 1302;
+        ALM_MACHINE_CLAMP_NOT_OK:  "FC_AlarmTextID" := 1401;
+        ALM_ROBOT_GRIP_NOT_OK:     "FC_AlarmTextID" := 1402;
+        ALM_TRAY_PLACE_NOT_OK:     "FC_AlarmTextID" := 1403;
+        ELSE
+            "FC_AlarmTextID" := 1999;
+    END_CASE;
+END_FUNCTION
+
+// 功能块说明: 安全链与基础设备故障统一判定，按优先级返回一个报警码
+FUNCTION "FC_CheckSafetyAndAlarm" : "E_AlarmCode"
+VAR_INPUT
+    Safety     : "T_Safety";
+    M1Fault    : BOOL;
+    M2Fault    : BOOL;
+    M3Fault    : BOOL;
+    RobotFault : BOOL;
+END_VAR
+BEGIN
+    "FC_CheckSafetyAndAlarm" := ALM_NONE;
+    IF NOT Safety.EStopOK THEN
+        "FC_CheckSafetyAndAlarm" := ALM_ESTOP_ACTIVE;
+    ELSIF NOT Safety.SafetyDoorClosed THEN
+        "FC_CheckSafetyAndAlarm" := ALM_SAFETY_DOOR_OPEN;
+    ELSIF NOT Safety.AirPressureOK THEN
+        "FC_CheckSafetyAndAlarm" := ALM_AIR_PRESS_LOW;
+    ELSIF NOT Safety.ServoReady THEN
+        "FC_CheckSafetyAndAlarm" := ALM_SERVO_NOT_READY;
+    ELSIF M1Fault THEN
+        "FC_CheckSafetyAndAlarm" := ALM_MACHINE1_FAULT;
+    ELSIF M2Fault THEN
+        "FC_CheckSafetyAndAlarm" := ALM_MACHINE2_FAULT;
+    ELSIF M3Fault THEN
+        "FC_CheckSafetyAndAlarm" := ALM_MACHINE3_FAULT;
+    ELSIF RobotFault THEN
+        "FC_CheckSafetyAndAlarm" := ALM_ROBOT_TIMEOUT;
+    END_IF;
+END_FUNCTION
+
+// 功能块说明: 单机床控制状态机（待机/等上料/加工/等下料/故障），并统计单机加工时长
+FUNCTION_BLOCK "FB_MachineUnit"
+VAR_INPUT
+    Enable      : BOOL;
+    IO          : "T_MachineIO";
+    PartLoaded  : BOOL;
+END_VAR
+VAR_IN_OUT
+    Ctrl        : "T_MachineCtrl";
+END_VAR
+VAR
+    T_Process   : TON;
+    RiseDone    : R_TRIG;
+END_VAR
+BEGIN
+    Ctrl.LoadReq := FALSE;
+    Ctrl.UnloadReq := FALSE;
+    Ctrl.RunCmd := FALSE;
+
+    IF (NOT Enable) OR IO.Fault THEN
+        Ctrl.State := MC_FAULT;
+    END_IF;
+
+    CASE Ctrl.State OF
+        MC_IDLE:
+            IF Enable AND IO.Ready AND IO.DoorClosed THEN
+                Ctrl.State := MC_WAIT_LOAD;
+            END_IF;
+
+        MC_WAIT_LOAD:
+            Ctrl.LoadReq := TRUE;
+            IF PartLoaded THEN
+                IF IO.ClampOK THEN
+                    Ctrl.State := MC_PROCESSING;
+                END_IF;
+            END_IF;
+
+        MC_PROCESSING:
+            Ctrl.RunCmd := TRUE;
+            T_Process(IN := TRUE, PT := T#24H);
+            IF IO.CycleDone THEN
+                Ctrl.State := MC_WAIT_UNLOAD;
+            END_IF;
+
+        MC_WAIT_UNLOAD:
+            T_Process(IN := FALSE, PT := T#24H);
+            RiseDone(CLK := IO.CycleDone);
+            IF RiseDone.Q THEN
+                Ctrl.LastProcessMs := TIME_TO_DINT(T_Process.ET);
+                IF Ctrl.AvgProcessMs = 0 THEN
+                    Ctrl.AvgProcessMs := Ctrl.LastProcessMs;
+                ELSE
+                    // EMA近似: 75%历史 + 25%最新
+                    Ctrl.AvgProcessMs := (Ctrl.AvgProcessMs * 3 + Ctrl.LastProcessMs) / 4;
+                END_IF;
+            END_IF;
+
+            Ctrl.UnloadReq := TRUE;
+            IF Ctrl.CurrentPartID = 0 THEN
+                Ctrl.ProcessedCount := Ctrl.ProcessedCount + 1;
+                Ctrl.State := MC_WAIT_LOAD;
+            END_IF;
+
+        MC_FAULT:
+            T_Process(IN := FALSE, PT := T#24H);
+            Ctrl.RunCmd := FALSE;
+    END_CASE;
+END_FUNCTION_BLOCK
+
+// 功能块说明: 机器人调度与上/下料执行，包含托盘到位、机器人夹紧、工位选择、优先级优化
+FUNCTION_BLOCK "FB_RobotDispatcher"
+VAR_INPUT
+    RobotReady      : BOOL;
+    RobotInCycle    : BOOL;
+    RobotGripOK     : BOOL;
+    LoadReq         : ARRAY[1..3] OF BOOL;
+    UnloadReq       : ARRAY[1..3] OF BOOL;
+    TrayRawPlaceOK  : ARRAY[1..4] OF BOOL;
+    TrayDonePlaceOK : ARRAY[1..4] OF BOOL;
+END_VAR
+VAR_IN_OUT
+    Trays           : ARRAY[1..4] OF "T_Tray";
+    Grippers        : ARRAY[1..4] OF "T_Gripper";
+    Machines        : ARRAY[1..3] OF "T_MachineCtrl";
+    PartIDSeed      : DINT;
+END_VAR
+VAR_OUTPUT
+    RobotStartCmd   : BOOL;
+    AlarmCode       : "E_AlarmCode";
+    SelectedMachine : INT;
+END_VAR
+VAR
+    i, j, k         : INT;
+    SelMachine      : INT;
+    SelTrayRaw      : INT;
+    SelTrayDone     : INT;
+    SelRawSlot      : INT;
+    SelDoneSlot     : INT;
+    BestScore       : DINT;
+    Score           : DINT;
+    T_Handshake     : TON;
+    T_RobotCycle    : TON;
+    AnyNeed         : BOOL;
+    FoundFreeGrip   : BOOL;
+END_VAR
+BEGIN
+    AlarmCode := ALM_NONE;
+    RobotStartCmd := FALSE;
+    SelectedMachine := 0;
+    SelMachine := 0;
+    AnyNeed := FALSE;
+    BestScore := -2147483647;
+
+    // 调度策略说明:
+    // - 当多台机床同时请求服务时，先满足“下料请求”，避免机床长时间占用成品。
+    // - 若下料请求并列，则比较 AvgProcessMs，优先服务节拍更长的机床，降低整体瓶颈风险。
+    FOR i := 1 TO 3 DO
+        IF LoadReq[i] OR UnloadReq[i] THEN
+            AnyNeed := TRUE;
+            Score := 0;
+            IF UnloadReq[i] THEN
+                Score := Score + 1000000;
+            END_IF;
+            Score := Score + Machines[i].AvgProcessMs;
+            IF Score > BestScore THEN
+                BestScore := Score;
+                SelMachine := i;
+            END_IF;
+        END_IF;
+    END_FOR;
+
+    T_Handshake(IN := AnyNeed AND NOT RobotReady, PT := T#5S);
+    IF T_Handshake.Q THEN
+        AlarmCode := ALM_HANDSHAKE_TIMEOUT;
+        RETURN;
+    END_IF;
+
+    T_RobotCycle(IN := RobotInCycle, PT := T#45S);
+    IF T_RobotCycle.Q THEN
+        AlarmCode := ALM_ROBOT_TIMEOUT;
+        RETURN;
+    END_IF;
+
+    IF (SelMachine = 0) OR (NOT RobotReady) THEN
+        RETURN;
+    END_IF;
+
+    RobotStartCmd := TRUE;
+    SelectedMachine := SelMachine;
+
+    // 先找托盘（且要求托盘到位）
+    SelTrayRaw := 0;
+    SelTrayDone := 0;
+    FOR i := 1 TO 4 DO
+        IF (SelTrayRaw = 0) AND (Trays[i].RawCount > 0) THEN
+            IF TrayRawPlaceOK[i] THEN
+                SelTrayRaw := i;
+            ELSE
+                AlarmCode := ALM_TRAY_PLACE_NOT_OK;
+                RETURN;
+            END_IF;
+        END_IF;
+        IF (SelTrayDone = 0) AND (Trays[i].DoneCount < Trays[i].Capacity) THEN
+            IF TrayDonePlaceOK[i] THEN
+                SelTrayDone := i;
+            ELSE
+                AlarmCode := ALM_TRAY_PLACE_NOT_OK;
+                RETURN;
+            END_IF;
+        END_IF;
+    END_FOR;
+
+    // 上料
+    IF LoadReq[SelMachine] THEN
+        IF SelTrayRaw = 0 THEN
+            AlarmCode := ALM_NO_RAW_PART;
+            RETURN;
+        END_IF;
+
+        SelRawSlot := 0;
+        FOR k := 1 TO 40 DO
+            IF Trays[SelTrayRaw].RawSlotOccupied[k] AND (NOT Trays[SelTrayRaw].RawSlotProcessed[k]) THEN
+                SelRawSlot := k;
+                EXIT;
+            END_IF;
+        END_FOR;
+        IF SelRawSlot = 0 THEN
+            AlarmCode := ALM_TRAY_EMPTY;
+            RETURN;
+        END_IF;
+
+        FoundFreeGrip := FALSE;
+        FOR j := 1 TO 4 DO
+            IF Grippers[j].Present AND Grippers[j].Healthy AND (NOT Grippers[j].HasPart) THEN
+                FoundFreeGrip := TRUE;
+                PartIDSeed := PartIDSeed + 1;
+                Grippers[j].HasPart := TRUE;
+                Grippers[j].PartID := PartIDSeed;
+                Grippers[j].SourceTray := SelTrayRaw;
+                Grippers[j].SourceSlot := SelRawSlot;
+
+                // 机器人夹紧到位判断
+                IF NOT RobotGripOK THEN
+                    AlarmCode := ALM_ROBOT_GRIP_NOT_OK;
+                    RETURN;
+                END_IF;
+
+                Trays[SelTrayRaw].RawSlotOccupied[SelRawSlot] := FALSE;
+                Trays[SelTrayRaw].RawCount := Trays[SelTrayRaw].RawCount - 1;
+
+                Machines[SelMachine].CurrentPartID := Grippers[j].PartID;
+                Machines[SelMachine].CurrentSrcTray := Grippers[j].SourceTray;
+                Machines[SelMachine].CurrentSrcSlot := Grippers[j].SourceSlot;
+
+                Grippers[j].HasPart := FALSE;
+                Grippers[j].PartID := 0;
+                Grippers[j].SourceTray := 0;
+                Grippers[j].SourceSlot := 0;
+                EXIT;
+            END_IF;
+        END_FOR;
+
+        IF NOT FoundFreeGrip THEN
+            AlarmCode := ALM_GRIPPER_MISMATCH;
+            RETURN;
+        END_IF;
+    END_IF;
+
+    // 下料
+    IF UnloadReq[SelMachine] THEN
+        IF SelTrayDone = 0 THEN
+            AlarmCode := ALM_TRAY_FULL;
+            RETURN;
+        END_IF;
+
+        IF Machines[SelMachine].CurrentPartID = 0 THEN
+            AlarmCode := ALM_GRIPPER_EMPTY;
+            RETURN;
+        END_IF;
+
+        SelDoneSlot := 0;
+        FOR k := 1 TO 40 DO
+            IF NOT Trays[SelTrayDone].DoneSlotOccupied[k] THEN
+                SelDoneSlot := k;
+                EXIT;
+            END_IF;
+        END_FOR;
+        IF SelDoneSlot = 0 THEN
+            AlarmCode := ALM_TRAY_FULL;
+            RETURN;
+        END_IF;
+
+        FoundFreeGrip := FALSE;
+        FOR j := 1 TO 4 DO
+            IF Grippers[j].Present AND Grippers[j].Healthy AND (NOT Grippers[j].HasPart) THEN
+                FoundFreeGrip := TRUE;
+
+                Grippers[j].HasPart := TRUE;
+                Grippers[j].PartID := Machines[SelMachine].CurrentPartID;
+
+                IF NOT RobotGripOK THEN
+                    AlarmCode := ALM_ROBOT_GRIP_NOT_OK;
+                    RETURN;
+                END_IF;
+
+                Trays[SelTrayDone].DoneSlotOccupied[SelDoneSlot] := TRUE;
+                Trays[SelTrayDone].DoneCount := Trays[SelTrayDone].DoneCount + 1;
+
+                // 把来源原料工位打上“已加工”标记
+                IF (Machines[SelMachine].CurrentSrcTray >= 1) AND (Machines[SelMachine].CurrentSrcTray <= 4) THEN
+                    IF (Machines[SelMachine].CurrentSrcSlot >= 1) AND (Machines[SelMachine].CurrentSrcSlot <= 40) THEN
+                        Trays[Machines[SelMachine].CurrentSrcTray].RawSlotProcessed[Machines[SelMachine].CurrentSrcSlot] := TRUE;
+                    END_IF;
+                END_IF;
+
+                Machines[SelMachine].CurrentPartID := 0;
+                Machines[SelMachine].CurrentSrcTray := 0;
+                Machines[SelMachine].CurrentSrcSlot := 0;
+
+                Grippers[j].HasPart := FALSE;
+                Grippers[j].PartID := 0;
+                EXIT;
+            END_IF;
+        END_FOR;
+
+        IF NOT FoundFreeGrip THEN
+            AlarmCode := ALM_GRIPPER_MISMATCH;
+            RETURN;
+        END_IF;
+    END_IF;
+END_FUNCTION_BLOCK
+
+// 功能块说明: 汇总全单元统计信息（未加工/已加工/在制/各机床产量与平均节拍）
+FUNCTION "FC_CalcStats" : "T_CellStats"
+VAR_INPUT
+    Trays    : ARRAY[1..4] OF "T_Tray";
+    Machines : ARRAY[1..3] OF "T_MachineCtrl";
+END_VAR
+VAR
+    i        : INT;
+    S        : "T_CellStats";
+END_VAR
+BEGIN
+    S.TotalRaw := 0;
+    S.TotalDone := 0;
+    S.TotalInProcess := 0;
+
+    FOR i := 1 TO 4 DO
+        S.TotalRaw := S.TotalRaw + INT_TO_DINT(Trays[i].RawCount);
+        S.TotalDone := S.TotalDone + INT_TO_DINT(Trays[i].DoneCount);
+        S.TrayRawRemain[i] := INT_TO_DINT(Trays[i].RawCount);
+        S.TrayDoneCount[i] := INT_TO_DINT(Trays[i].DoneCount);
+    END_FOR;
+
+    FOR i := 1 TO 3 DO
+        IF Machines[i].CurrentPartID <> 0 THEN
+            S.TotalInProcess := S.TotalInProcess + 1;
+        END_IF;
+        S.MachineDone[i] := Machines[i].ProcessedCount;
+        S.MachineAvgMs[i] := Machines[i].AvgProcessMs;
+    END_FOR;
+
+    S.RemainingRaw := S.TotalRaw;
+    "FC_CalcStats" := S;
+END_FUNCTION
+
+// 功能块说明: 单元总控入口，连接HMI、安全、三台机床、机器人调度与统计输出
+FUNCTION_BLOCK "FB_FlexibleCell"
+VAR_INPUT
+    HMI            : "T_HMI";
+    Safety         : "T_Safety";
+    RobotReady     : BOOL;
+    RobotFault     : BOOL;
+    RobotInCycle   : BOOL;
+    RobotGripOK    : BOOL;
+    TrayRawPlaceOK : ARRAY[1..4] OF BOOL;
+    TrayDonePlaceOK: ARRAY[1..4] OF BOOL;
+    MachineReadyIn : ARRAY[1..3] OF BOOL;
+    MachineFaultIn : ARRAY[1..3] OF BOOL;
+    MachineDoorIn  : ARRAY[1..3] OF BOOL;
+    MachineClampIn : ARRAY[1..3] OF BOOL;
+    MachineDoneIn  : ARRAY[1..3] OF BOOL;
+END_VAR
+VAR_OUTPUT
+    CellState      : "E_CellState";
+    AlarmActive    : BOOL;
+    AlarmCode      : "E_AlarmCode";
+    AlarmTextID    : INT;
+    StopAll        : BOOL;
+    RobotStartCmd  : BOOL;
+    LoadReq        : ARRAY[1..3] OF BOOL;
+    UnloadReq      : ARRAY[1..3] OF BOOL;
+    MachineRunCmd  : ARRAY[1..3] OF BOOL;
+    SelectedMachine: INT;
+    Stats          : "T_CellStats";
+END_VAR
+VAR
+    i, k           : INT;
+    SafetyAlarm    : "E_AlarmCode";
+    RobotAlarm     : "E_AlarmCode";
+    MIO            : ARRAY[1..3] OF "T_MachineIO";
+    MCtrl          : ARRAY[1..3] OF "T_MachineCtrl";
+    Trays          : ARRAY[1..4] OF "T_Tray";
+    Grippers       : ARRAY[1..4] OF "T_Gripper";
+    PartIDSeed     : DINT;
+    StartEdge      : R_TRIG;
+    ResetEdge      : R_TRIG;
+    DoorFall       : F_TRIG;
+    FB_M1          : "FB_MachineUnit";
+    FB_M2          : "FB_MachineUnit";
+    FB_M3          : "FB_MachineUnit";
+    FB_Robot       : "FB_RobotDispatcher";
+END_VAR
+BEGIN
+    StartEdge(CLK := HMI.CmdStart);
+    ResetEdge(CLK := HMI.CmdReset);
+    DoorFall(CLK := Safety.SafetyDoorClosed);
+
+    // 初始化说明:
+    // - 托盘容量默认为40。
+    // - 首次上电按 RawCount 初始化原料工位占用。
+    // - 手抓默认在位且健康，可按现场IO改成真实检测值。
+    FOR i := 1 TO 4 DO
+        IF Trays[i].Capacity = 0 THEN
+            Trays[i].Capacity := 40;
+        END_IF;
+        IF NOT Trays[i].InitDone THEN
+            // 若工程师已在DB写入RawCount，则自动占用前RawCount个原料位
+            FOR k := 1 TO 40 DO
+                Trays[i].RawSlotOccupied[k] := FALSE;
+                Trays[i].RawSlotProcessed[k] := FALSE;
+                Trays[i].DoneSlotOccupied[k] := FALSE;
+            END_FOR;
+            FOR k := 1 TO Trays[i].RawCount DO
+                IF k <= 40 THEN
+                    Trays[i].RawSlotOccupied[k] := TRUE;
+                END_IF;
+            END_FOR;
+            Trays[i].InitDone := TRUE;
+        END_IF;
+
+        IF NOT Grippers[i].Present THEN
+            Grippers[i].Present := TRUE;
+        END_IF;
+        IF NOT Grippers[i].Healthy THEN
+            Grippers[i].Healthy := TRUE;
+        END_IF;
+    END_FOR;
+
+    FOR i := 1 TO 3 DO
+        MIO[i].Ready := MachineReadyIn[i];
+        MIO[i].Fault := MachineFaultIn[i];
+        MIO[i].DoorClosed := MachineDoorIn[i];
+        MIO[i].ClampOK := MachineClampIn[i];
+        MIO[i].CycleDone := MachineDoneIn[i];
+    END_FOR;
+
+    SafetyAlarm := "FC_CheckSafetyAndAlarm"(
+        Safety := Safety,
+        M1Fault := MIO[1].Fault,
+        M2Fault := MIO[2].Fault,
+        M3Fault := MIO[3].Fault,
+        RobotFault := RobotFault
+    );
+
+    AlarmCode := SafetyAlarm;
+    AlarmActive := (AlarmCode <> ALM_NONE);
+    AlarmTextID := "FC_AlarmTextID"(Code := AlarmCode);
+
+    IF DoorFall.Q THEN
+        CellState := ST_FAULT;
+    END_IF;
+
+    CASE CellState OF
+        ST_INIT:
+            StopAll := TRUE;
+            FOR i := 1 TO 3 DO
+                MCtrl[i].State := MC_IDLE;
+            END_FOR;
+            IF HMI.ModeAuto THEN
+                CellState := ST_IDLE;
+            END_IF;
+
+        ST_IDLE:
+            StopAll := TRUE;
+            IF AlarmActive THEN
+                CellState := ST_FAULT;
+            ELSIF StartEdge.Q AND HMI.ModeAuto THEN
+                CellState := ST_AUTO_RUN;
+            END_IF;
+
+        ST_AUTO_RUN:
+            StopAll := FALSE;
+            IF HMI.CmdStop THEN
+                CellState := ST_STOPPING;
+            ELSIF AlarmActive THEN
+                CellState := ST_FAULT;
+            ELSE
+                FB_M1(Enable := TRUE, IO := MIO[1], PartLoaded := (MCtrl[1].CurrentPartID <> 0), Ctrl := MCtrl[1]);
+                FB_M2(Enable := TRUE, IO := MIO[2], PartLoaded := (MCtrl[2].CurrentPartID <> 0), Ctrl := MCtrl[2]);
+                FB_M3(Enable := TRUE, IO := MIO[3], PartLoaded := (MCtrl[3].CurrentPartID <> 0), Ctrl := MCtrl[3]);
+
+                FOR i := 1 TO 3 DO
+                    LoadReq[i] := MCtrl[i].LoadReq;
+                    UnloadReq[i] := MCtrl[i].UnloadReq;
+                    MachineRunCmd[i] := MCtrl[i].RunCmd;
+                END_FOR;
+
+                // 机床夹紧校验说明:
+                // - 机床进入加工态且内部有工件时，ClampOK必须保持为TRUE。
+                // - 若夹紧信号丢失，立即报警并切入故障态，防止带风险继续加工。
+                FOR i := 1 TO 3 DO
+                    IF (MCtrl[i].CurrentPartID <> 0) AND (NOT MIO[i].ClampOK) AND (MCtrl[i].State = MC_PROCESSING) THEN
+                        AlarmCode := ALM_MACHINE_CLAMP_NOT_OK;
+                        AlarmActive := TRUE;
+                        AlarmTextID := "FC_AlarmTextID"(Code := AlarmCode);
+                        CellState := ST_FAULT;
+                    END_IF;
+                END_FOR;
+
+                IF CellState = ST_AUTO_RUN THEN
+                    FB_Robot(
+                        RobotReady := RobotReady,
+                        RobotInCycle := RobotInCycle,
+                        RobotGripOK := RobotGripOK,
+                        LoadReq := LoadReq,
+                        UnloadReq := UnloadReq,
+                        TrayRawPlaceOK := TrayRawPlaceOK,
+                        TrayDonePlaceOK := TrayDonePlaceOK,
+                        Trays := Trays,
+                        Grippers := Grippers,
+                        Machines := MCtrl,
+                        PartIDSeed := PartIDSeed,
+                        RobotStartCmd => RobotStartCmd,
+                        AlarmCode => RobotAlarm,
+                        SelectedMachine => SelectedMachine
+                    );
+
+                    IF RobotAlarm <> ALM_NONE THEN
+                        AlarmCode := RobotAlarm;
+                        AlarmActive := TRUE;
+                        AlarmTextID := "FC_AlarmTextID"(Code := AlarmCode);
+                        CellState := ST_FAULT;
+                    END_IF;
+                END_IF;
+            END_IF;
+
+        ST_STOPPING:
+            StopAll := TRUE;
+            RobotStartCmd := FALSE;
+            FOR i := 1 TO 3 DO
+                LoadReq[i] := FALSE;
+                UnloadReq[i] := FALSE;
+                MachineRunCmd[i] := FALSE;
+            END_FOR;
+            IF NOT HMI.CmdStop THEN
+                CellState := ST_IDLE;
+            END_IF;
+
+        ST_FAULT:
+            StopAll := TRUE;
+            RobotStartCmd := FALSE;
+            FOR i := 1 TO 3 DO
+                LoadReq[i] := FALSE;
+                UnloadReq[i] := FALSE;
+                MachineRunCmd[i] := FALSE;
+            END_FOR;
+            IF HMI.AckAlarm AND ResetEdge.Q AND (SafetyAlarm = ALM_NONE) THEN
+                AlarmCode := ALM_NONE;
+                AlarmActive := FALSE;
+                AlarmTextID := 0;
+                CellState := ST_IDLE;
+            END_IF;
+    END_CASE;
+
+    Stats := "FC_CalcStats"(Trays := Trays, Machines := MCtrl);
+END_FUNCTION_BLOCK
