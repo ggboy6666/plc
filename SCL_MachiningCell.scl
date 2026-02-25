@@ -4,6 +4,78 @@
 * 设计原则: 每个功能单独块，且每个块均有注释说明，便于快速定位
 ********************************************************************)
 
+
+// ========================= 信号总表（类型 + 起始偏移）=========================
+// 说明:
+// 1) 下表为工程集成建议地址，便于在PLC/HMI/机器人联调时快速对照。
+// 2) 偏移量为“起始量”，可按项目硬件重新分配；建议保持同类信号连续编址。
+// 3) 命名与本程序变量一一对应，便于查找。
+// -----------------------------------------------------------------------------
+// [安全输入 Safety]            类型   建议地址(起始偏移)
+// Safety.EStopOK               BOOL   %I0.0
+// Safety.SafetyDoorClosed      BOOL   %I0.1
+// Safety.AirPressureOK         BOOL   %I0.2
+// Safety.ServoReady            BOOL   %I0.3
+//
+// [HMI输入 HMI]                类型   建议地址(起始偏移)
+// HMI.CmdStart                 BOOL   %M0.0
+// HMI.CmdStop                  BOOL   %M0.1
+// HMI.CmdReset                 BOOL   %M0.2
+// HMI.ModeAuto                 BOOL   %M0.3
+// HMI.AckAlarm                 BOOL   %M0.4
+//
+// [机器人输入]                  类型   建议地址(起始偏移)
+// RobotReady                   BOOL   %I1.0
+// RobotFault                   BOOL   %I1.1
+// RobotInCycle                 BOOL   %I1.2
+//
+// [机床输入-1号]                类型   建议地址(起始偏移)
+// MachineReadyIn[1]            BOOL   %I2.0
+// MachineFaultIn[1]            BOOL   %I2.1
+// MachineDoorIn[1]             BOOL   %I2.2
+// MachineClampIn[1]            BOOL   %I2.3
+// MachineDoneIn[1]             BOOL   %I2.4
+//
+// [机床输入-2号]                类型   建议地址(起始偏移)
+// MachineReadyIn[2]            BOOL   %I3.0
+// MachineFaultIn[2]            BOOL   %I3.1
+// MachineDoorIn[2]             BOOL   %I3.2
+// MachineClampIn[2]            BOOL   %I3.3
+// MachineDoneIn[2]             BOOL   %I3.4
+//
+// [机床输入-3号]                类型   建议地址(起始偏移)
+// MachineReadyIn[3]            BOOL   %I4.0
+// MachineFaultIn[3]            BOOL   %I4.1
+// MachineDoorIn[3]             BOOL   %I4.2
+// MachineClampIn[3]            BOOL   %I4.3
+// MachineDoneIn[3]             BOOL   %I4.4
+//
+// [控制输出]                    类型   建议地址(起始偏移)
+// StopAll                      BOOL   %Q0.0
+// RobotStartCmd                BOOL   %Q0.1
+// MachineRunCmd[1]             BOOL   %Q1.0
+// MachineRunCmd[2]             BOOL   %Q1.1
+// MachineRunCmd[3]             BOOL   %Q1.2
+// LoadReq[1]                   BOOL   %Q1.3
+// LoadReq[2]                   BOOL   %Q1.4
+// LoadReq[3]                   BOOL   %Q1.5
+// UnloadReq[1]                 BOOL   %Q1.6
+// UnloadReq[2]                 BOOL   %Q1.7
+// UnloadReq[3]                 BOOL   %Q2.0
+//
+// [报警/状态到HMI]              类型   建议地址(起始偏移)
+// AlarmActive                  BOOL   %M10.0
+// AlarmCode                    WORD   %MW12
+// AlarmTextID                  INT    %MW14
+// CellState                    INT    %MW16
+// Stats.TotalRaw               DINT   %MD20
+// Stats.TotalDone              DINT   %MD24
+// Stats.TotalInProcess         DINT   %MD28
+// Stats.RemainingRaw           DINT   %MD32
+// Stats.MachineDone[1]         DINT   %MD40
+// Stats.MachineDone[2]         DINT   %MD44
+// Stats.MachineDone[3]         DINT   %MD48
+// -----------------------------------------------------------------------------
 // ========================= 基础状态/报警类型定义 =========================
 TYPE "E_CellState" : (
     ST_INIT,       // 初始化
