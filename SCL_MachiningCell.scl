@@ -1,24 +1,25 @@
 (********************************************************************
 * 项目: 三机床 + 库卡机器人 + 4托盘架 柔性单元控制（模块化）
 * 语言: Siemens SCL
-* 设计原则: 每个功能单独块，便于调试、复用、维护
+* 设计原则: 每个功能单独块，且每个块均有注释说明，便于快速定位
 ********************************************************************)
 
+// ========================= 基础状态/报警类型定义 =========================
 TYPE "E_CellState" : (
-    ST_INIT,
-    ST_IDLE,
-    ST_AUTO_RUN,
-    ST_STOPPING,
-    ST_FAULT
+    ST_INIT,       // 初始化
+    ST_IDLE,       // 待机
+    ST_AUTO_RUN,   // 自动运行
+    ST_STOPPING,   // 停止中
+    ST_FAULT       // 故障
 );
 END_TYPE
 
 TYPE "E_MachineState" : (
-    MC_IDLE,
-    MC_WAIT_LOAD,
-    MC_PROCESSING,
-    MC_WAIT_UNLOAD,
-    MC_FAULT
+    MC_IDLE,        // 机床待机
+    MC_WAIT_LOAD,   // 等待上料
+    MC_PROCESSING,  // 加工中
+    MC_WAIT_UNLOAD, // 等待下料
+    MC_FAULT        // 机床故障
 );
 END_TYPE
 
@@ -41,69 +42,72 @@ TYPE "E_AlarmCode" : (
 );
 END_TYPE
 
+// ========================= 数据结构定义 =========================
 TYPE "T_Gripper" : STRUCT
-    Present        : BOOL;
-    Healthy        : BOOL;
-    HasPart        : BOOL;
-    PartID         : DINT;
+    Present        : BOOL;   // 手抓在位
+    Healthy        : BOOL;   // 手抓健康
+    HasPart        : BOOL;   // 手抓上是否有工件
+    PartID         : DINT;   // 当前抓取工件ID
 END_STRUCT;
 END_TYPE
 
 TYPE "T_Tray" : STRUCT
-    Capacity       : INT;
-    RawCount       : INT;
-    DoneCount      : INT;
+    Capacity       : INT;    // 托盘容量（本项目40）
+    RawCount       : INT;    // 未加工数量
+    DoneCount      : INT;    // 已加工数量
 END_STRUCT;
 END_TYPE
 
 TYPE "T_MachineIO" : STRUCT
-    Ready          : BOOL;
-    Fault          : BOOL;
-    DoorClosed     : BOOL;
-    ClampOK        : BOOL;
-    CycleDone      : BOOL;
+    Ready          : BOOL;   // 机床就绪
+    Fault          : BOOL;   // 机床故障
+    DoorClosed     : BOOL;   // 机床门关闭
+    ClampOK        : BOOL;   // 夹紧完成
+    CycleDone      : BOOL;   // 加工完成
 END_STRUCT;
 END_TYPE
 
 TYPE "T_MachineCtrl" : STRUCT
-    State          : "E_MachineState";
-    CurrentPartID  : DINT;
-    ProcessedCount : DINT;
-    LoadReq        : BOOL;
-    UnloadReq      : BOOL;
-    RunCmd         : BOOL;
+    State          : "E_MachineState"; // 机床状态
+    CurrentPartID  : DINT;              // 机床内工件ID
+    ProcessedCount : DINT;              // 本机床累计加工数
+    LoadReq        : BOOL;              // 请求上料
+    UnloadReq      : BOOL;              // 请求下料
+    RunCmd         : BOOL;              // 机床运行命令
 END_STRUCT;
 END_TYPE
 
 TYPE "T_HMI" : STRUCT
-    CmdStart       : BOOL;
-    CmdStop        : BOOL;
-    CmdReset       : BOOL;
-    ModeAuto       : BOOL;
-    AckAlarm       : BOOL;
+    CmdStart       : BOOL;   // 启动按钮
+    CmdStop        : BOOL;   // 停止按钮
+    CmdReset       : BOOL;   // 复位按钮
+    ModeAuto       : BOOL;   // 自动模式
+    AckAlarm       : BOOL;   // 报警确认
 END_STRUCT;
 END_TYPE
 
 TYPE "T_Safety" : STRUCT
-    EStopOK          : BOOL;
-    SafetyDoorClosed : BOOL;
-    AirPressureOK    : BOOL;
-    ServoReady       : BOOL;
+    EStopOK          : BOOL; // 急停回路正常
+    SafetyDoorClosed : BOOL; // 安全门关闭
+    AirPressureOK    : BOOL; // 气压正常
+    ServoReady       : BOOL; // 伺服准备好
 END_STRUCT;
 END_TYPE
 
 TYPE "T_CellStats" : STRUCT
-    TotalRaw       : DINT;
-    TotalDone      : DINT;
-    TotalInProcess : DINT;
-    RemainingRaw   : DINT;
-    MachineDone    : ARRAY[1..3] OF DINT;
+    TotalRaw       : DINT;               // 全部未加工
+    TotalDone      : DINT;               // 全部已加工
+    TotalInProcess : DINT;               // 在制数量
+    RemainingRaw   : DINT;               // 剩余未加工
+    MachineDone    : ARRAY[1..3] OF DINT;// 三台机床各自加工数
 END_STRUCT;
 END_TYPE
 
+// ========================= FC: 报警码 -> HMI文本ID =========================
+// 作用: 将报警枚举统一映射成HMI画面可读取的文本编号
 FUNCTION "FC_AlarmTextID" : INT
 VAR_INPUT
-    Code : "E_AlarmCode";
+    Code : "E_AlarmCode"; // 报警码
 END_VAR
 BEGIN
     CASE Code OF
@@ -127,13 +131,15 @@ BEGIN
     END_CASE;
 END_FUNCTION
 
+// ========================= FC: 安全与故障报警判断 =========================
+// 作用: 按优先级输出当前报警（安全相关优先）
 FUNCTION "FC_CheckSafetyAndAlarm" : "E_AlarmCode"
 VAR_INPUT
-    Safety     : "T_Safety";
-    M1Fault    : BOOL;
-    M2Fault    : BOOL;
-    M3Fault    : BOOL;
-    RobotFault : BOOL;
+    Safety     : "T_Safety"; // 安全输入
+    M1Fault    : BOOL;        // 1号机床故障
+    M2Fault    : BOOL;        // 2号机床故障
+    M3Fault    : BOOL;        // 3号机床故障
+    RobotFault : BOOL;        // 机器人故障
 END_VAR
 BEGIN
     "FC_CheckSafetyAndAlarm" := ALM_NONE;
@@ -157,24 +163,29 @@ BEGIN
     END_IF;
 END_FUNCTION
 
+// ========================= FB: 单机床控制块 =========================
+// 作用: 一台机床一个实例；三台机床并行时实例化三次
 FUNCTION_BLOCK "FB_MachineUnit"
 VAR_INPUT
-    Enable    : BOOL;
-    IO        : "T_MachineIO";
-    PartLoaded: BOOL;
+    Enable    : BOOL;         // 机床使能
+    IO        : "T_MachineIO"; // 机床输入
+    PartLoaded: BOOL;         // 是否已上料（机床内存在PartID）
 END_VAR
 VAR_IN_OUT
-    Ctrl      : "T_MachineCtrl";
+    Ctrl      : "T_MachineCtrl"; // 机床控制/状态
 END_VAR
 BEGIN
+    // 每扫描周期默认清命令，再根据状态置位
     Ctrl.LoadReq := FALSE;
     Ctrl.UnloadReq := FALSE;
     Ctrl.RunCmd := FALSE;
 
+    // 使能断开或故障，进入故障态
     IF (NOT Enable) OR IO.Fault THEN
         Ctrl.State := MC_FAULT;
     END_IF;
 
+    // 单机床状态机
     CASE Ctrl.State OF
         MC_IDLE:
             IF Enable AND IO.Ready AND IO.DoorClosed THEN
@@ -205,30 +216,32 @@ BEGIN
     END_CASE;
 END_FUNCTION_BLOCK
 
+// ========================= FB: 机器人调度块 =========================
+// 作用: 负责三机床请求仲裁、机器人握手超时、托盘与手抓分配、上/下料动作
 FUNCTION_BLOCK "FB_RobotDispatcher"
 VAR_INPUT
-    RobotReady      : BOOL;
-    RobotInCycle    : BOOL;
-    LoadReq         : ARRAY[1..3] OF BOOL;
-    UnloadReq       : ARRAY[1..3] OF BOOL;
+    RobotReady      : BOOL;                // 机器人就绪
+    RobotInCycle    : BOOL;                // 机器人动作中
+    LoadReq         : ARRAY[1..3] OF BOOL; // 三台机床上料请求
+    UnloadReq       : ARRAY[1..3] OF BOOL; // 三台机床下料请求
 END_VAR
 VAR_IN_OUT
-    Trays           : ARRAY[1..4] OF "T_Tray";
-    Grippers        : ARRAY[1..4] OF "T_Gripper";
-    Machines        : ARRAY[1..3] OF "T_MachineCtrl";
-    PartIDSeed      : DINT;
+    Trays           : ARRAY[1..4] OF "T_Tray";        // 4个托盘
+    Grippers        : ARRAY[1..4] OF "T_Gripper";     // 4个手抓
+    Machines        : ARRAY[1..3] OF "T_MachineCtrl"; // 3台机床控制数据
+    PartIDSeed      : DINT;                            // PartID生成种子
 END_VAR
 VAR_OUTPUT
-    RobotStartCmd   : BOOL;
-    AlarmCode       : "E_AlarmCode";
+    RobotStartCmd   : BOOL;           // 机器人启动命令
+    AlarmCode       : "E_AlarmCode"; // 本块报警输出
 END_VAR
 VAR
     i, j            : INT;
-    SelMachine      : INT;
-    SelTrayRaw      : INT;
-    SelTrayDone     : INT;
-    T_Handshake     : TON;
-    T_RobotCycle    : TON;
+    SelMachine      : INT; // 选中的服务机床
+    SelTrayRaw      : INT; // 选中的原料托盘
+    SelTrayDone     : INT; // 选中的成品托盘
+    T_Handshake     : TON; // 握手超时定时器
+    T_RobotCycle    : TON; // 机器人循环超时定时器
     AnyNeed         : BOOL;
     FoundFreeGrip   : BOOL;
 END_VAR
@@ -238,6 +251,7 @@ BEGIN
     SelMachine := 0;
     AnyNeed := FALSE;
 
+    // 请求仲裁：选择第一台有需求的机床
     FOR i := 1 TO 3 DO
         IF (LoadReq[i] OR UnloadReq[i]) AND (SelMachine = 0) THEN
             SelMachine := i;
@@ -247,12 +261,14 @@ BEGIN
         END_IF;
     END_FOR;
 
+    // 握手超时：机床有需求但机器人长时间未就绪
     T_Handshake(IN := AnyNeed AND NOT RobotReady, PT := T#5S);
     IF T_Handshake.Q THEN
         AlarmCode := ALM_HANDSHAKE_TIMEOUT;
         RETURN;
     END_IF;
 
+    // 循环超时：机器人单次动作过长
     T_RobotCycle(IN := RobotInCycle, PT := T#45S);
     IF T_RobotCycle.Q THEN
         AlarmCode := ALM_ROBOT_TIMEOUT;
@@ -265,6 +281,7 @@ BEGIN
 
     RobotStartCmd := TRUE;
 
+    // 选择托盘：一个有原料，一个可放成品
     SelTrayRaw := 0;
     SelTrayDone := 0;
 
@@ -277,6 +294,7 @@ BEGIN
         END_IF;
     END_FOR;
 
+    // 上料逻辑
     IF LoadReq[SelMachine] THEN
         IF SelTrayRaw = 0 THEN
             AlarmCode := ALM_NO_RAW_PART;
@@ -304,6 +322,7 @@ BEGIN
         END_IF;
     END_IF;
 
+    // 下料逻辑
     IF UnloadReq[SelMachine] THEN
         IF SelTrayDone = 0 THEN
             AlarmCode := ALM_TRAY_FULL;
@@ -336,6 +355,8 @@ BEGIN
     END_IF;
 END_FUNCTION_BLOCK
 
+// ========================= FC: 统计汇总块 =========================
+// 作用: 汇总未加工/已加工/在制以及每台机床产量
 FUNCTION "FC_CalcStats" : "T_CellStats"
 VAR_INPUT
     Trays    : ARRAY[1..4] OF "T_Tray";
@@ -366,6 +387,8 @@ BEGIN
     "FC_CalcStats" := S;
 END_FUNCTION
 
+// ========================= FB: 单元总控块 =========================
+// 作用: HMI交互 + 安全联锁 + 三机床并行实例化 + 机器人调度整合
 FUNCTION_BLOCK "FB_FlexibleCell"
 VAR_INPUT
     HMI            : "T_HMI";
@@ -395,25 +418,35 @@ VAR
     i              : INT;
     SafetyAlarm    : "E_AlarmCode";
     RobotAlarm     : "E_AlarmCode";
+
+    // 三台机床输入镜像
     MIO            : ARRAY[1..3] OF "T_MachineIO";
+    // 三台机床控制结构
     MCtrl          : ARRAY[1..3] OF "T_MachineCtrl";
+
+    // 4托盘与4手抓状态
     Trays          : ARRAY[1..4] OF "T_Tray";
     Grippers       : ARRAY[1..4] OF "T_Gripper";
     PartIDSeed     : DINT;
+
+    // 上升沿/下降沿触发器
     StartEdge      : R_TRIG;
     ResetEdge      : R_TRIG;
     DoorFall       : F_TRIG;
+
+    // 子功能块实例
     FB_M1          : "FB_MachineUnit";
     FB_M2          : "FB_MachineUnit";
     FB_M3          : "FB_MachineUnit";
     FB_Robot       : "FB_RobotDispatcher";
 END_VAR
 BEGIN
+    // HMI按钮与安全门边沿
     StartEdge(CLK := HMI.CmdStart);
     ResetEdge(CLK := HMI.CmdReset);
     DoorFall(CLK := Safety.SafetyDoorClosed);
 
-    // 初始化托盘容量与手抓安装状态
+    // 初始化: 托盘容量默认40；手抓默认安装且健康
     FOR i := 1 TO 4 DO
         IF Trays[i].Capacity = 0 THEN
             Trays[i].Capacity := 40;
@@ -426,6 +459,7 @@ BEGIN
         END_IF;
     END_FOR;
 
+    // 采集三台机床输入
     FOR i := 1 TO 3 DO
         MIO[i].Ready := MachineReadyIn[i];
         MIO[i].Fault := MachineFaultIn[i];
@@ -434,6 +468,7 @@ BEGIN
         MIO[i].CycleDone := MachineDoneIn[i];
     END_FOR;
 
+    // 统一安全报警判断
     SafetyAlarm := "FC_CheckSafetyAndAlarm"(
         Safety := Safety,
         M1Fault := MIO[1].Fault,
@@ -446,10 +481,12 @@ BEGIN
     AlarmActive := (AlarmCode <> ALM_NONE);
     AlarmTextID := "FC_AlarmTextID"(Code := AlarmCode);
 
+    // 安全门打开沿: 立即故障停机
     IF DoorFall.Q THEN
         CellState := ST_FAULT;
     END_IF;
 
+    // 单元总状态机
     CASE CellState OF
         ST_INIT:
             StopAll := TRUE;
@@ -475,16 +512,19 @@ BEGIN
             ELSIF AlarmActive THEN
                 CellState := ST_FAULT;
             ELSE
+                // 三台机床并行调用（每台独立块）
                 FB_M1(Enable := TRUE, IO := MIO[1], PartLoaded := (MCtrl[1].CurrentPartID <> 0), Ctrl := MCtrl[1]);
                 FB_M2(Enable := TRUE, IO := MIO[2], PartLoaded := (MCtrl[2].CurrentPartID <> 0), Ctrl := MCtrl[2]);
                 FB_M3(Enable := TRUE, IO := MIO[3], PartLoaded := (MCtrl[3].CurrentPartID <> 0), Ctrl := MCtrl[3]);
 
+                // 对外输出各机床请求/运行命令
                 FOR i := 1 TO 3 DO
                     LoadReq[i] := MCtrl[i].LoadReq;
                     UnloadReq[i] := MCtrl[i].UnloadReq;
                     MachineRunCmd[i] := MCtrl[i].RunCmd;
                 END_FOR;
 
+                // 调用机器人调度块
                 FB_Robot(
                     RobotReady := RobotReady,
                     RobotInCycle := RobotInCycle,
@@ -498,6 +538,7 @@ BEGIN
                     AlarmCode => RobotAlarm
                 );
 
+                // 机器人块报警上抛
                 IF RobotAlarm <> ALM_NONE THEN
                     AlarmCode := RobotAlarm;
                     AlarmActive := TRUE;
@@ -534,5 +575,6 @@ BEGIN
             END_IF;
     END_CASE;
 
+    // 统计输出
     Stats := "FC_CalcStats"(Trays := Trays, Machines := MCtrl);
 END_FUNCTION_BLOCK
